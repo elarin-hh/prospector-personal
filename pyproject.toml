@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prospect"
+version = "1.0.0"
+description = "Prospecção de Personal Trainers no Instagram — encontra WhatsApp via bio e landing pages"
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.43.0",
+    "beautifulsoup4>=4.12",
+    "requests>=2.31",
+    "rich>=13",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+prospect = "prospect.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

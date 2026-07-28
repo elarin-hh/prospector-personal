@@ -1,0 +1,11 @@
+.env
+.venv/
+sessions/
+data/whatsapp_web_profile/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.DS_Store
+
