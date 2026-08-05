@@ -28,16 +28,23 @@ from rich.layout import Layout
 from rich.columns import Columns
 from rich import box
 
-from prospect import __version__
+from prospect import __version__, supabase_sync
 from prospect.config import (
     IG_USERNAME, MIN_FOLLOWERS, MAX_FOLLOWERS,
-    SEED_ACCOUNTS, SEARCH_HASHTAGS,
+    SEED_ACCOUNTS, SEARCH_HASHTAGS, DEFAULT_CITY,
 )
 from prospect.db import (
     init_db, get_all_leads, get_leads_by_status,
-    get_stats, export_csv,
+    get_stats, export_csv, export_city_csv,
+    get_city_summary, get_leads_by_city, list_cities,
+    get_contact_funnel, get_pending_contact_leads, set_contact_status,
+    backfill_cities, sync_pending_leads, apply_remote_contact_status,
+    get_unsynced_leads, get_lead,
 )
-from prospect.models import Lead, LeadStatus, ProspectStats
+from prospect.location import normalize_city_input
+from prospect.models import (
+    Lead, LeadStatus, ContactStatus, ProspectStats, CONTACT_STATUS_LABELS,
+)
 from prospect.browser import InstagramBrowser
 from prospect.pipeline import prospect_from_account, prospect_from_hashtag
 
@@ -86,6 +93,12 @@ def _config_panel() -> Panel:
     grid.add_row("👥 Seguidores", f"{MIN_FOLLOWERS:,} — {MAX_FOLLOWERS:,}")
     grid.add_row("🏢 Academias", ", ".join(SEED_ACCOUNTS) if SEED_ACCOUNTS else "nenhuma definida")
     grid.add_row("#️⃣  Hashtags", ", ".join(f"#{h}" for h in SEARCH_HASHTAGS[:3]))
+    grid.add_row("📍 Cidade padrão", DEFAULT_CITY or "inferir da bio")
+    grid.add_row("☁️  Supabase", supabase_sync.status_message())
+
+    pending_sync = len(get_unsynced_leads())
+    if pending_sync:
+        grid.add_row("⏳ A sincronizar", f"{pending_sync} leads")
 
     return Panel(grid, title="⚙️  Configuração", border_style="yellow", box=box.ROUNDED)
 
@@ -107,10 +120,77 @@ def _menu() -> str:
     table.add_row("[8]", "🔍 Analisar perfil específico")
     table.add_row("[9]", "🔄 Revarrer WhatsApp nos Leads do Banco")
     table.add_row("[10]", "💬 Disparo Automatizado via WhatsApp Web (Humano)")
+    table.add_row("[11]", "🗺️  Leads por Cidade")
+    table.add_row("[12]", "✅ Atualizar status de contato de um lead")
+    table.add_row("[13]", "☁️  Sincronizar com Supabase")
     table.add_row("[0]", "🚪 Sair")
 
     console.print(table)
-    return Prompt.ask("\n[bold cyan]Escolha uma opção[/]", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"], default="1")
+    return Prompt.ask(
+        "\n[bold cyan]Escolha uma opção[/]",
+        choices=[str(i) for i in range(14)],
+        default="1",
+    )
+
+
+_CONTACT_STYLES: dict[ContactStatus, str] = {
+    ContactStatus.NOT_CONTACTED: "dim",
+    ContactStatus.QUEUED: "cyan",
+    ContactStatus.CONTACTED: "bold green",
+    ContactStatus.RESPONDED: "bold blue",
+    ContactStatus.NO_ANSWER: "yellow",
+    ContactStatus.INVALID_NUMBER: "dim red",
+    ContactStatus.RESTRICTED: "red",
+    ContactStatus.NOT_INTERESTED: "dim",
+    ContactStatus.CONVERTED: "bold magenta",
+}
+
+
+def _contact_badge(lead: Lead) -> str:
+    """Status de contato formatado para a tabela."""
+    label = CONTACT_STATUS_LABELS.get(lead.contact_status, lead.contact_status)
+    style = _CONTACT_STYLES.get(lead.contact_status, "white")
+    return f"[{style}]{label}[/]"
+
+
+def _ask_city_hint(prompt: str) -> str:
+    """
+    Pergunta a cidade da prospecção e normaliza ("floripa" → "Florianópolis").
+    A bio do lead sempre tem prioridade sobre essa cidade.
+    """
+    raw = Prompt.ask(prompt, default=DEFAULT_CITY).strip()
+    if not raw:
+        return ""
+
+    city, state = normalize_city_input(raw)
+    label = f"{city}/{state}" if state else city
+    console.print(f"  [dim]📍 Cidade da prospecção: {label}[/]")
+    return f"{city} - {state}" if state else city
+
+
+def _ask_city_choice(prompt: str = "[bold]Cidade[/]") -> str | None:
+    """
+    Lista as cidades do banco e devolve a escolhida.
+    None = usuário cancelou. "" = leads sem cidade identificada.
+    """
+    cities = list_cities()
+    if not cities:
+        console.print("[yellow]Nenhuma cidade identificada no banco ainda.[/]")
+        console.print("[dim]Use a opção [13] para inferir as cidades das bios já coletadas.[/]")
+        return None
+
+    for i, city in enumerate(cities, 1):
+        console.print(f"  [cyan]{i:>2}[/] {city}")
+    console.print("   [dim]0[/] [dim]leads sem cidade identificada[/]")
+
+    choice = IntPrompt.ask(f"\n{prompt} [dim](número)[/]", default=1)
+    if choice == 0:
+        return ""
+    if 1 <= choice <= len(cities):
+        return cities[choice - 1]
+
+    console.print("[yellow]Opção inválida[/]")
+    return None
 
 
 def _ensure_browser() -> InstagramBrowser | None:
@@ -147,6 +227,7 @@ def _action_prospect_accounts() -> None:
         return
 
     max_per = IntPrompt.ask("[bold]Máximo de seguidores por academia[/]", default=100)
+    city_hint = _ask_city_hint("[bold]Cidade dessas academias[/] [dim](opcional — usada quando a bio não diz)[/]")
 
     stats = ProspectStats()
     leads_found: list[Lead] = []
@@ -165,6 +246,7 @@ def _action_prospect_accounts() -> None:
                 on_status=on_status,
                 on_lead=on_lead,
                 stats=stats,
+                city_hint=city_hint,
             )
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️  Interrompido pelo usuário[/]")
@@ -192,6 +274,7 @@ def _action_prospect_hashtags() -> None:
         return
 
     max_per = IntPrompt.ask("[bold]Máximo de perfis por hashtag[/]", default=20)
+    city_hint = _ask_city_hint("[bold]Cidade dessas hashtags[/] [dim](opcional — usada quando a bio não diz)[/]")
 
     stats = ProspectStats()
     leads_found: list[Lead] = []
@@ -210,6 +293,7 @@ def _action_prospect_hashtags() -> None:
                 on_status=on_status,
                 on_lead=on_lead,
                 stats=stats,
+                city_hint=city_hint,
             )
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️  Interrompido pelo usuário[/]")
@@ -239,13 +323,14 @@ def _action_list_leads(status_filter: LeadStatus = None) -> None:
     )
     table.add_column("#", style="dim", width=4)
     table.add_column("Username", style="bold cyan", max_width=20)
-    table.add_column("Nome", max_width=20)
+    table.add_column("Nome", max_width=18)
+    table.add_column("Cidade", style="magenta", max_width=18)
     table.add_column("Seg.", style="green", justify="right", width=8)
     table.add_column("Score", style="yellow", justify="right", width=6)
     table.add_column("WhatsApp", style="bold green", max_width=18)
-    table.add_column("Fonte WA", max_width=18)
     table.add_column("Status", max_width=14)
-    table.add_column("Origem", style="dim", max_width=15)
+    table.add_column("Contato", max_width=16)
+    table.add_column("Origem", style="dim", max_width=13)
 
     for i, lead in enumerate(leads[:50], 1):
         status_style = {
@@ -261,13 +346,14 @@ def _action_list_leads(status_filter: LeadStatus = None) -> None:
         table.add_row(
             str(i),
             f"@{lead.username}",
-            lead.full_name[:20],
+            lead.full_name[:18],
+            lead.location_label,
             f"{lead.followers:,}",
             str(lead.score),
             whatsapp_display,
-            lead.whatsapp_source or "—",
             f"[{status_style}]{lead.status.value}[/]",
-            lead.source_account[:15] if lead.source_account else "—",
+            _contact_badge(lead),
+            lead.source_account[:13] if lead.source_account else "—",
         )
 
     console.print(table)
@@ -314,6 +400,35 @@ def _action_stats() -> None:
     table.add_row("Erros", str(stats.errors), "perfis inacessíveis")
 
     console.print(table)
+
+    # Funil de contato
+    funnel = get_contact_funnel()
+    if funnel:
+        contact_table = Table(
+            title="📞 Funil de Contato", box=box.ROUNDED, border_style="cyan"
+        )
+        contact_table.add_column("Status de contato", style="bold")
+        contact_table.add_column("Leads", justify="right", style="cyan")
+
+        for status in ContactStatus:
+            total = funnel.get(status.value, 0)
+            if total:
+                contact_table.add_row(CONTACT_STATUS_LABELS[status], str(total))
+
+        console.print()
+        console.print(contact_table)
+
+    # Cidades com mais leads
+    summary = get_city_summary()
+    top_cities = [r for r in summary if r["city"]][:5]
+    if top_cities:
+        console.print("\n[bold magenta]🗺️  Top 5 cidades:[/]")
+        for row in top_cities:
+            console.print(
+                f"  • {row['city']}/{row['state'] or '—'} — {row['total']} leads, "
+                f"{row['com_whatsapp'] or 0} com WhatsApp, "
+                f"{row['pendentes'] or 0} pendentes de contato"
+            )
 
     # Top leads
     wpp_leads = get_leads_by_status(LeadStatus.WHATSAPP_FOUND)
@@ -426,6 +541,214 @@ def _action_rescan_whatsapp() -> None:
     _print_summary(stats, leads_found)
 
 
+def _action_leads_by_city() -> None:
+    """Dashboard de leads agrupados por cidade."""
+    summary = get_city_summary()
+    if not summary:
+        console.print("[yellow]Nenhum lead no banco ainda.[/]")
+        return
+
+    table = Table(
+        title="🗺️  Leads por Cidade",
+        box=box.ROUNDED,
+        border_style="magenta",
+        show_lines=False,
+    )
+    table.add_column("Cidade", style="bold magenta", max_width=24)
+    table.add_column("UF", style="dim", width=4)
+    table.add_column("Total", justify="right", style="bold")
+    table.add_column("Com WA", justify="right", style="green")
+    table.add_column("Contatados", justify="right", style="cyan")
+    table.add_column("Pendentes", justify="right", style="bold yellow")
+    table.add_column("Responderam", justify="right", style="blue")
+    table.add_column("Score méd.", justify="right", style="dim")
+
+    for row in summary:
+        table.add_row(
+            row["city"] or "[dim]— não identificada —[/]",
+            row["state"] or "—",
+            str(row["total"]),
+            str(row["com_whatsapp"] or 0),
+            str(row["contatados"] or 0),
+            str(row["pendentes"] or 0),
+            str(row["responderam"] or 0),
+            str(row["score_medio"] or 0),
+        )
+
+    console.print(table)
+
+    unknown = next((r["total"] for r in summary if not r["city"]), 0)
+    if unknown:
+        console.print(
+            f"[dim]{unknown} leads sem cidade identificada — "
+            f"a opção [13] tenta inferir da bio.[/]"
+        )
+
+    if not Confirm.ask("\n[bold]Abrir os leads de uma cidade?[/]", default=False):
+        return
+
+    console.print()
+    city = _ask_city_choice("[bold]Qual cidade[/]")
+    if city is None:
+        return
+
+    only_pending = Confirm.ask(
+        "[bold]Só os pendentes de contato (com WhatsApp)?[/]", default=False
+    )
+    leads = get_leads_by_city(city, only_pending=only_pending)
+
+    if not leads:
+        console.print("[yellow]Nenhum lead nesse filtro.[/]")
+        return
+
+    _print_lead_table(leads, f"{city or 'Sem cidade'} ({len(leads)})")
+
+    if Confirm.ask("\n[bold]Exportar essa cidade para CSV?[/]", default=False):
+        filepath, total = export_city_csv(city)
+        console.print(f"[bold green]✅ {total} leads exportados para:[/] {filepath}")
+
+
+def _action_update_contact_status() -> None:
+    """Atualiza manualmente o status de contato de um lead."""
+    username = Prompt.ask("[bold]Username do lead[/]").strip().lstrip("@")
+    if not username:
+        return
+
+    lead = get_lead(username)
+    if not lead:
+        console.print(f"[red]❌ @{username} não está no banco.[/]")
+        return
+
+    console.print(
+        f"\n[bold cyan]@{lead.username}[/] — {lead.full_name or 'Personal'} — "
+        f"📍 {lead.location_label}"
+    )
+    console.print(f"  Status atual: {_contact_badge(lead)}")
+    if lead.contacted_at:
+        console.print(f"  [dim]Último contato: {lead.contacted_at[:16]} "
+                      f"({lead.contact_attempts} tentativa(s))[/]")
+
+    options = list(ContactStatus)
+    console.print("\n[bold]Novo status de contato:[/]")
+    for i, status in enumerate(options, 1):
+        console.print(f"  [cyan]{i:>2}[/] {CONTACT_STATUS_LABELS[status]}")
+
+    choice = IntPrompt.ask("\n[bold]Escolha[/]", default=1)
+    if not 1 <= choice <= len(options):
+        console.print("[yellow]Opção inválida[/]")
+        return
+
+    new_status = options[choice - 1]
+    channel = ""
+    if new_status != ContactStatus.NOT_CONTACTED:
+        channel = Prompt.ask(
+            "[bold]Canal[/]", default=lead.contact_channel or "whatsapp"
+        ).strip()
+
+    updated = set_contact_status(
+        username, new_status, channel=channel,
+        increment_attempts=(new_status == ContactStatus.CONTACTED),
+    )
+    if not updated:
+        console.print("[red]❌ Falha ao atualizar.[/]")
+        return
+
+    console.print(f"\n[bold green]✅ Status atualizado:[/] {_contact_badge(updated)}")
+    if supabase_sync.is_configured():
+        if updated.synced_at:
+            console.print("[dim]   ☁️  Espelhado no Supabase.[/]")
+        else:
+            console.print("[dim]   ⏳ Pendente de sync — use a opção [13].[/]")
+
+
+def _action_supabase_sync() -> None:
+    """Sincroniza leads e cidades com o Supabase."""
+    console.print(f"\n[bold cyan]☁️  Supabase[/] — {supabase_sync.status_message()}")
+
+    if not supabase_sync.is_configured():
+        console.print(
+            "\n[yellow]Configure no .env:[/]\n"
+            "  SUPABASE_URL=https://xxxxxxxx.supabase.co\n"
+            "  SUPABASE_SERVICE_KEY=<service_role key>\n\n"
+            "[dim]E aplique supabase/migrations/0001_create_leads.sql "
+            "no SQL Editor do Supabase.[/]"
+        )
+        return
+
+    ok, message = supabase_sync.check_connection()
+    console.print(f"  {'✅' if ok else '❌'} {message}")
+    if not ok:
+        return
+
+    # Preenche cidades faltantes antes de subir
+    pending_cities = [l for l in get_all_leads() if not l.city]
+    if pending_cities and Confirm.ask(
+        f"\n[bold]{len(pending_cities)} leads sem cidade. Inferir da bio agora?[/]",
+        default=True,
+    ):
+        backfill_cities(on_status=lambda msg: console.print(msg))
+
+    unsynced = get_unsynced_leads()
+    force_all = False
+    if not unsynced:
+        console.print("\n[green]Todos os leads já estão sincronizados.[/]")
+        force_all = Confirm.ask("[bold]Reenviar tudo mesmo assim?[/]", default=False)
+        if not force_all:
+            return
+    else:
+        console.print(f"\n[bold]{len(unsynced)} leads pendentes de sincronização.[/]")
+
+    synced, remaining, error = sync_pending_leads(
+        on_status=lambda msg: console.print(msg), force_all=force_all
+    )
+    console.print(f"\n[bold green]✅ {synced} leads enviados ao Supabase[/]")
+    if remaining:
+        console.print(f"[yellow]⚠️  {remaining} ainda pendentes[/]")
+    if error:
+        console.print(f"[red]   {error}[/]")
+
+    if Confirm.ask(
+        "\n[bold]Trazer do Supabase os status de contato editados no painel?[/]",
+        default=False,
+    ):
+        updated, pull_error = apply_remote_contact_status(
+            on_status=lambda msg: console.print(msg)
+        )
+        if pull_error:
+            console.print(f"[red]❌ {pull_error}[/]")
+        else:
+            console.print(f"[bold green]✅ {updated} leads atualizados localmente[/]")
+
+
+def _print_lead_table(leads: list[Lead], title: str) -> None:
+    """Tabela compacta de leads, usada pelas telas de cidade."""
+    table = Table(title=f"📋 {title}", box=box.ROUNDED, border_style="cyan")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Username", style="bold cyan", max_width=22)
+    table.add_column("Nome", max_width=20)
+    table.add_column("Cidade", style="magenta", max_width=18)
+    table.add_column("Seg.", justify="right", style="green", width=8)
+    table.add_column("Score", justify="right", style="yellow", width=6)
+    table.add_column("WhatsApp", style="bold green", max_width=18)
+    table.add_column("Contato", max_width=16)
+
+    for i, lead in enumerate(leads[:80], 1):
+        table.add_row(
+            str(i),
+            f"@{lead.username}",
+            lead.full_name[:20],
+            lead.location_label,
+            f"{lead.followers:,}",
+            str(lead.score),
+            f"+{lead.whatsapp}" if lead.whatsapp else "—",
+            _contact_badge(lead),
+        )
+
+    console.print(table)
+    if len(leads) > 80:
+        console.print(f"[dim]... e mais {len(leads) - 80} leads[/]")
+
+
 def _print_summary(stats: ProspectStats, leads: list[Lead]) -> None:
     """Imprime resumo da prospecção."""
     console.print(Panel(
@@ -475,15 +798,32 @@ def _cleanup(signum=None, frame=None) -> None:
 
 def _action_send_whatsapp_campaign() -> None:
     """Disparo de mensagens de campanha via WhatsApp Web com simulação humana."""
-    from prospect.db import get_leads_by_status
     from prospect.whatsapp_sender import run_outreach_campaign
 
-    leads = get_leads_by_status(LeadStatus.WHATSAPP_FOUND)
+    # Fila = tem WhatsApp e nunca foi contatado
+    city = ""
+    if list_cities() and Confirm.ask(
+        "\n[bold]Filtrar a campanha por cidade?[/]", default=False
+    ):
+        console.print()
+        chosen = _ask_city_choice("[bold]Cidade da campanha[/]")
+        if chosen is None:
+            return
+        city = chosen
+
+    leads = get_pending_contact_leads(city=city)
     if not leads:
-        console.print("\n[yellow]⚠️ Nenhum lead com WhatsApp encontrado no banco de dados para enviar.[/]")
+        scope = f" em {city}" if city else ""
+        console.print(
+            f"\n[yellow]⚠️ Nenhum lead com WhatsApp pendente de contato{scope}.[/]"
+        )
+        console.print("[dim]   Leads já contatados não entram em novo disparo.[/]")
         return
 
-    console.print(f"\n[bold cyan]💬 {len(leads)} leads com WhatsApp disponíveis no banco de dados.[/]")
+    scope = f" em [magenta]{city}[/]" if city else ""
+    console.print(
+        f"\n[bold cyan]💬 {len(leads)} leads com WhatsApp aguardando primeiro contato{scope}.[/]"
+    )
 
     default_template = "{Oii}, tudo bem"
 
@@ -543,6 +883,12 @@ def main() -> None:
                 _action_rescan_whatsapp()
             elif choice == "10":
                 _action_send_whatsapp_campaign()
+            elif choice == "11":
+                _action_leads_by_city()
+            elif choice == "12":
+                _action_update_contact_status()
+            elif choice == "13":
+                _action_supabase_sync()
 
             if choice != "0":
                 console.print()

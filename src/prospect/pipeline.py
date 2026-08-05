@@ -14,9 +14,20 @@ from prospect.scraper import (
     search_by_hashtag, _is_personal_trainer,
 )
 from prospect.whatsapp_finder import find_whatsapp
+from prospect.location import resolve_location
 from prospect.models import Lead, LeadStatus, ProspectStats
 from prospect.db import upsert_lead, lead_exists, init_db, get_leads_without_whatsapp
-from prospect.config import MIN_FOLLOWERS, MAX_FOLLOWERS
+from prospect.config import MIN_FOLLOWERS, MAX_FOLLOWERS, DEFAULT_CITY
+
+
+def _apply_location(lead: Lead, city_hint: str = "") -> None:
+    """
+    Define cidade/estado do lead: bio primeiro, depois a cidade informada
+    na prospecção, depois DEFAULT_CITY.
+    """
+    lead.city, lead.state = resolve_location(
+        lead.bio, lead.full_name, hint=city_hint or DEFAULT_CITY
+    )
 
 
 def rescan_whatsapp_existing_leads(
@@ -84,9 +95,13 @@ def prospect_from_account(
     on_status: Callable[[str], None] = None,
     on_lead: Callable[[Lead], None] = None,
     stats: ProspectStats = None,
+    city_hint: str = "",
 ) -> None:
     """
     Pipeline: busca seguidores de uma conta e prospecta personal trainers.
+
+    `city_hint` é a cidade da academia — usada quando a bio do lead não
+    revela a localização (academia local ⇒ seguidor provavelmente local).
     """
     emit = on_status or (lambda msg: None)
     notify = on_lead or (lambda lead: None)
@@ -120,6 +135,7 @@ def prospect_from_account(
             continue
 
         lead.source_account = account
+        _apply_location(lead, city_hint)
 
         # Verifica se perfil é privado
         if lead.is_private:
@@ -155,7 +171,7 @@ def prospect_from_account(
         # Qualificado!
         lead.status = LeadStatus.QUALIFIED
         stats.leads_qualified += 1
-        emit(f"  ✅ @{username} qualificado! ({lead.followers} seg, score: {lead.score})")
+        emit(f"  ✅ @{username} qualificado! ({lead.followers} seg, score: {lead.score}, 📍 {lead.location_label})")
 
         # Busca WhatsApp
         if lead.bio_link or lead.bio:
@@ -190,9 +206,13 @@ def prospect_from_hashtag(
     on_status: Callable[[str], None] = None,
     on_lead: Callable[[Lead], None] = None,
     stats: ProspectStats = None,
+    city_hint: str = "",
 ) -> None:
     """
     Pipeline: busca posts de uma hashtag e prospecta personal trainers.
+
+    `city_hint` cobre os leads cuja bio não revela a cidade — útil com
+    hashtags geográficas (#personaltrainercuritiba).
     """
     emit = on_status or (lambda msg: None)
     notify = on_lead or (lambda lead: None)
@@ -223,6 +243,7 @@ def prospect_from_hashtag(
             continue
 
         lead.source_account = f"#{tag}"
+        _apply_location(lead, city_hint)
 
         # Verifica se perfil é privado
         if lead.is_private:
@@ -258,7 +279,7 @@ def prospect_from_hashtag(
         # Qualificado!
         lead.status = LeadStatus.QUALIFIED
         stats.leads_qualified += 1
-        emit(f"  ✅ @{username} qualificado! ({lead.followers} seg, score: {lead.score})")
+        emit(f"  ✅ @{username} qualificado! ({lead.followers} seg, score: {lead.score}, 📍 {lead.location_label})")
 
         # Busca WhatsApp
         if lead.bio_link or lead.bio:

@@ -59,6 +59,20 @@ MAX_FOLLOWERS: int = _getint("MAX_FOLLOWERS", 50000)
 DELAY_MIN: int = _getint("DELAY_MIN", 3)
 DELAY_MAX: int = _getint("DELAY_MAX", 8)
 
+# ── Supabase ───────────────────────────────────────────────────────────────
+# URL do projeto (ex: https://xxxxxxxx.supabase.co)
+SUPABASE_URL: str = _get("SUPABASE_URL").rstrip("/")
+# Use a SERVICE ROLE KEY: a tabela tem RLS habilitado sem policy pública.
+SUPABASE_KEY: str = _get("SUPABASE_SERVICE_KEY") or _get("SUPABASE_KEY")
+SUPABASE_TABLE: str = _get("SUPABASE_TABLE", "leads")
+# Envia cada lead pro Supabase durante a prospecção
+SUPABASE_SYNC: bool = _getbool("SUPABASE_SYNC", True)
+SUPABASE_TIMEOUT: int = _getint("SUPABASE_TIMEOUT", 15)
+
+# ── Localização ────────────────────────────────────────────────────────────
+# Cidade padrão dos leads quando não é possível inferir da bio (opcional)
+DEFAULT_CITY: str = _get("DEFAULT_CITY")
+
 # ── Caminhos ───────────────────────────────────────────────────────────────
 DATA_DIR: Path = _PROJECT_ROOT / "data"
 SESSIONS_DIR: Path = _PROJECT_ROOT / "sessions"

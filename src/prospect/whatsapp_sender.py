@@ -23,11 +23,21 @@ from typing import Callable, Optional
 from playwright.sync_api import sync_playwright, BrowserContext, Page
 
 from prospect.config import DATA_DIR
-from prospect.models import Lead, LeadStatus
+from prospect.models import Lead, LeadStatus, ContactStatus
 from prospect.db import upsert_lead
 
 # Diretório para salvar sessão do WhatsApp Web (cookies, IndexedDB, etc.)
 WA_SESSION_DIR = DATA_DIR / "whatsapp_web_profile"
+
+# Status que já encerram o contato — não entram em novo disparo
+_ALREADY_HANDLED = frozenset({
+    ContactStatus.CONTACTED,
+    ContactStatus.RESPONDED,
+    ContactStatus.NO_ANSWER,
+    ContactStatus.INVALID_NUMBER,
+    ContactStatus.NOT_INTERESTED,
+    ContactStatus.CONVERTED,
+})
 
 
 def parse_spintax(text: str) -> str:
@@ -55,28 +65,48 @@ def format_lead_message(template: str, lead: Lead) -> str:
     return parse_spintax(text)
 
 
-def should_retry_restricted_lead(lead_notes: str, cooldown_hours: int = 24) -> tuple[bool, str]:
+def _last_attempt_at(lead: Lead) -> Optional[datetime]:
     """
-    Verifica se um lead que falhou por restrição temporária já cumpriu a carência de 24h.
-    Retorna (pode_retentar, mensagem_explicativa).
+    Data da última tentativa de contato. Usa contacted_at e cai para o
+    formato antigo gravado em notes ("Tentado contato em YYYY-MM-DD HH:MM").
     """
-    if not lead_notes or ("restrita" not in lead_notes.lower() and "restrito" not in lead_notes.lower()):
+    if lead.contacted_at:
+        try:
+            return datetime.fromisoformat(lead.contacted_at)
+        except ValueError:
+            pass
+
+    match = re.search(r"em (\d{4}-\d{2}-\d{2} \d{2}:\d{2})", lead.notes or "")
+    if match:
+        try:
+            return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M")
+        except ValueError:
+            pass
+
+    return None
+
+
+def should_retry_restricted_lead(lead: Lead, cooldown_hours: int = 24) -> tuple[bool, str]:
+    """
+    Verifica se um lead que falhou por restrição temporária do WhatsApp já
+    cumpriu a carência. Retorna (pode_retentar, mensagem_explicativa).
+    """
+    if lead.contact_status != ContactStatus.RESTRICTED:
         return True, ""
 
-    match = re.search(r"Tentado contato em (\d{4}-\d{2}-\d{2} \d{2}:\d{2})", lead_notes)
-    if not match:
+    attempted_dt = _last_attempt_at(lead)
+    if not attempted_dt:
         return True, ""
 
-    try:
-        attempted_dt = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M")
-        elapsed_hours = (datetime.now() - attempted_dt).total_seconds() / 3600
-        if elapsed_hours < cooldown_hours:
-            remaining_hours = max(1, int(cooldown_hours - elapsed_hours))
-            return False, f"tentado há {int(elapsed_hours)}h. Carência de 24h em andamento (restam ~{remaining_hours}h)"
-    except Exception:
-        pass
+    elapsed_hours = (datetime.now() - attempted_dt).total_seconds() / 3600
+    if elapsed_hours < cooldown_hours:
+        remaining_hours = max(1, int(cooldown_hours - elapsed_hours))
+        return False, (
+            f"tentado há {int(elapsed_hours)}h. Carência de {cooldown_hours}h "
+            f"em andamento (restam ~{remaining_hours}h)"
+        )
 
-    return True, "carência de 24h concluída, re-testando disparo"
+    return True, f"carência de {cooldown_hours}h concluída, re-testando disparo"
 
 
 class WhatsAppWebSender:
@@ -324,19 +354,25 @@ def run_outreach_campaign(
             if not lead.whatsapp:
                 continue
 
-            if "enviado" in (lead.notes or "").lower():
-                emit(f"  ⏭️  @{lead.username} (+{lead.whatsapp}) já contatado anteriormente. Ignorando.")
+            # Já contatado (ou descartado): não repete o disparo
+            if lead.contact_status in _ALREADY_HANDLED:
+                emit(
+                    f"  ⏭️  @{lead.username} (+{lead.whatsapp}) já contatado "
+                    f"({lead.contact_status.value}). Ignorando."
+                )
                 continue
 
-            if "restrita" in (lead.notes or "").lower() or "restrito" in (lead.notes or "").lower():
-                can_retry, reason = should_retry_restricted_lead(lead.notes, cooldown_hours=24)
+            if lead.contact_status == ContactStatus.RESTRICTED:
+                can_retry, reason = should_retry_restricted_lead(lead, cooldown_hours=24)
                 if not can_retry:
                     emit(f"  ⏭️  @{lead.username} (+{lead.whatsapp}) — {reason}. Ignorando por enquanto.")
                     continue
-                else:
-                    emit(f"  🔄 @{lead.username} (+{lead.whatsapp}) — {reason}. Re-tentando disparo...")
+                emit(f"  🔄 @{lead.username} (+{lead.whatsapp}) — {reason}. Re-tentando disparo...")
 
-            emit(f"\n💬 [{i}/{len(leads_to_process)}] Preparando envio para @{lead.username} (+{lead.whatsapp})...")
+            emit(
+                f"\n💬 [{i}/{len(leads_to_process)}] Preparando envio para "
+                f"@{lead.username} (+{lead.whatsapp}) — 📍 {lead.location_label}..."
+            )
             msg_text = format_lead_message(template, lead)
             emit(f"  📝 Mensagem gerada:\n   \"{msg_text[:80]}...\"")
 
@@ -345,10 +381,20 @@ def run_outreach_campaign(
             if success:
                 results["sent"] += 1
                 lead.notes = f"WhatsApp enviado em {time.strftime('%Y-%m-%d %H:%M')}"
+                lead.contact_status = ContactStatus.CONTACTED
+                lead.contact_channel = "whatsapp"
+                lead.contacted_at = datetime.now().isoformat()
+                lead.contact_attempts += 1
+                lead.last_contact_error = ""
                 upsert_lead(lead)
             elif "CONTA_RESTRITA" in status_msg or "restrita" in status_msg.lower():
                 results["restricted"] += 1
                 lead.notes = f"Tentado contato em {time.strftime('%Y-%m-%d %H:%M')}, mas conta WhatsApp estava restrita para novas conversas."
+                lead.contact_status = ContactStatus.RESTRICTED
+                lead.contact_channel = "whatsapp"
+                lead.contacted_at = datetime.now().isoformat()
+                lead.contact_attempts += 1
+                lead.last_contact_error = status_msg[:200]
                 upsert_lead(lead)
                 emit(f"  ⚠️  @{lead.username} — {status_msg}")
             elif "inválido" in status_msg.lower() or "não possui" in status_msg.lower() or "invalid" in status_msg.lower():
@@ -356,10 +402,19 @@ def run_outreach_campaign(
                 lead.status = LeadStatus.NO_WHATSAPP
                 lead.whatsapp_source = "invalid_number"
                 lead.notes = f"Número +{lead.whatsapp} verificado no WhatsApp Web como não registrado (inválido)."
+                lead.contact_status = ContactStatus.INVALID_NUMBER
+                lead.contact_channel = "whatsapp"
+                lead.contacted_at = datetime.now().isoformat()
+                lead.contact_attempts += 1
+                lead.last_contact_error = status_msg[:200]
                 upsert_lead(lead)
                 emit(f"  📵 @{lead.username} (+{lead.whatsapp}) reclassificado para 'Sem WhatsApp' (inválido).")
             else:
                 results["failed"] += 1
+                # Falha técnica não conta como contato: fica na fila pra retentar
+                lead.contact_attempts += 1
+                lead.last_contact_error = status_msg[:200]
+                upsert_lead(lead)
                 emit(f"  ❌ Falha no envio: {status_msg}")
 
             # Pausa aleatória entre disparos se não for o último
