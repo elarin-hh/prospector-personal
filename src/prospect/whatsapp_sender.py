@@ -24,6 +24,7 @@ from playwright.sync_api import sync_playwright, BrowserContext, Page
 
 from prospect.config import DATA_DIR
 from prospect.models import Lead, LeadStatus, ContactStatus
+from prospect.runtime import BROWSER_CHANNEL
 from prospect.db import upsert_lead
 
 # Diretório para salvar sessão do WhatsApp Web (cookies, IndexedDB, etc.)
@@ -137,6 +138,7 @@ class WhatsAppWebSender:
             self.context = self.playwright.chromium.launch_persistent_context(
                 user_data_dir=str(WA_SESSION_DIR),
                 headless=headless,
+                channel=BROWSER_CHANNEL,
                 args=args,
                 viewport={"width": 1280, "height": 800},
                 user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",

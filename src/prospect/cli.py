@@ -28,7 +28,7 @@ from rich.layout import Layout
 from rich.columns import Columns
 from rich import box
 
-from prospect import __version__, supabase_sync
+from prospect import __version__, runtime, supabase_sync
 from prospect.config import (
     IG_USERNAME, MIN_FOLLOWERS, MAX_FOLLOWERS,
     SEED_ACCOUNTS, SEARCH_HASHTAGS, DEFAULT_CITY,
@@ -47,6 +47,9 @@ from prospect.models import (
 )
 from prospect.browser import InstagramBrowser
 from prospect.pipeline import prospect_from_account, prospect_from_hashtag
+
+# Precisa vir antes do Console(): ajusta o encoding do console do Windows
+runtime.configure_console()
 
 console = Console()
 _browser: InstagramBrowser | None = None
@@ -849,6 +852,15 @@ def main() -> None:
     """Ponto de entrada principal."""
     signal.signal(signal.SIGINT, _cleanup)
     signal.signal(signal.SIGTERM, _cleanup)
+
+    # No .exe, aponta o Playwright para browsers/ e baixa o Chromium se faltar
+    if not runtime.bootstrap(on_status=lambda msg: console.print(msg)):
+        console.print(
+            "\n[bold red]❌ Sem navegador disponível.[/] "
+            "As opções de prospecção e disparo não vão funcionar."
+        )
+        console.print("[dim]   Verifique sua conexão e reabra o programa.[/]")
+        Prompt.ask("[dim]Pressione ENTER para continuar mesmo assim[/]", default="")
 
     init_db()
 

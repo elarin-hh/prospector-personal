@@ -15,6 +15,10 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+[project.optional-dependencies]
+# Empacotamento do .exe: pip install -e ".[build]"
+build = ["pyinstaller>=6.0"]
+
 [project.scripts]
 prospect = "prospect.cli:main"
 

@@ -6,12 +6,31 @@
 """
 from __future__ import annotations
 import os
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Carrega .env do diretório raiz do projeto
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-_ENV_PATH = _PROJECT_ROOT / ".env"
+# True quando rodando a partir do .exe gerado pelo PyInstaller
+IS_FROZEN: bool = getattr(sys, "frozen", False)
+
+
+def _app_root() -> Path:
+    """
+    Raiz onde ficam .env, data/ e sessions/.
+
+    No .exe, `__file__` aponta para dentro da pasta interna do PyInstaller,
+    então usamos a pasta do executável — o app fica portátil e os dados
+    sobrevivem entre execuções.
+    """
+    if IS_FROZEN:
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent.parent
+
+
+APP_ROOT: Path = _app_root()
+
+# Carrega .env de onde o app está instalado
+_ENV_PATH = APP_ROOT / ".env"
 load_dotenv(_ENV_PATH)
 
 
@@ -74,9 +93,12 @@ SUPABASE_TIMEOUT: int = _getint("SUPABASE_TIMEOUT", 15)
 DEFAULT_CITY: str = _get("DEFAULT_CITY")
 
 # ── Caminhos ───────────────────────────────────────────────────────────────
-DATA_DIR: Path = _PROJECT_ROOT / "data"
-SESSIONS_DIR: Path = _PROJECT_ROOT / "sessions"
+DATA_DIR: Path = APP_ROOT / "data"
+SESSIONS_DIR: Path = APP_ROOT / "sessions"
 DB_PATH: Path = DATA_DIR / "leads.db"
 
-DATA_DIR.mkdir(exist_ok=True)
-SESSIONS_DIR.mkdir(exist_ok=True)
+# Navegadores embutidos na distribuição (opcional — ver prospect/runtime.py)
+BROWSERS_DIR: Path = APP_ROOT / "browsers"
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)

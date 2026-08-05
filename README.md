@@ -157,6 +157,50 @@ prospect
 
 ---
 
+## 📦 Gerar o .exe (sem Python na máquina do usuário)
+
+```bash
+pip install pyinstaller
+
+python build_exe.py                  # zip de 50 MB
+python build_exe.py --with-browsers  # zip de 234 MB, roda offline
+python build_exe.py --no-zip         # só a pasta dist/PTProspect/
+```
+
+Sai em `dist/PTProspect-{leve,completo}.zip`. O usuário extrai, preenche o
+`.env` e dá duplo clique em `PTProspect.exe` — não precisa de Python.
+
+| Variante | Zip | Primeira execução |
+|---|---|---|
+| `leve` | 50 MB | Baixa o Chromium (~416 MB), precisa de internet |
+| `completo` (`--with-browsers`) | 234 MB | Funciona offline na hora |
+
+**Onde ficam os dados:** ao lado do `.exe` (`.env`, `data/`, `sessions/`,
+`browsers/`) — a distribuição é portátil, basta mover a pasta. Em
+desenvolvimento nada muda: continua tudo na raiz do repositório.
+
+**Diagnóstico:** `PTProspect.exe --selftest` verifica caminhos, banco e se o
+navegador abre. Use quando algo não funcionar na máquina do usuário.
+
+### Detalhes de empacotamento
+
+Três armadilhas que o `prospect.spec` e o `runtime.py` resolvem:
+
+1. **Driver do Playwright** — o `node.exe` + `package/` dentro do pacote
+   `playwright` precisam ser coletados explicitamente, senão o `.exe` abre
+   mas nenhum navegador sobe.
+2. **Navegadores não são embutidos pelo PyInstaller** — ficam fora do
+   `site-packages`. O `runtime.py` aponta o `PLAYWRIGHT_BROWSERS_PATH` para
+   `browsers/` ao lado do `.exe`, e baixa o Chromium se não achar.
+3. **Encoding do console** — congelado, o Rich cai no renderizador legado do
+   Windows e o primeiro emoji derruba o programa com `UnicodeEncodeError`.
+   O `runtime.configure_console()` força UTF-8 antes de criar o `Console()`.
+
+Todos os launches passam `channel="chromium"`, o que dispensa o
+`chromium_headless_shell` e economiza 270 MB na distribuição.
+
+---
+
 ## 🧪 Testes
 
 ```bash

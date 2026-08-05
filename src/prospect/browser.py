@@ -17,6 +17,7 @@ from prospect.config import (
     IG_USERNAME, IG_PASSWORD, HEADLESS,
     SESSIONS_DIR, DELAY_MIN, DELAY_MAX,
 )
+from prospect.runtime import BROWSER_CHANNEL
 
 _STATE_FILE = SESSIONS_DIR / f"{IG_USERNAME}_state.json"
 
@@ -89,6 +90,9 @@ class InstagramBrowser:
         try:
             self._browser = self._pw.chromium.launch(
                 headless=HEADLESS,
+                # Chromium completo nos dois modos: dispensa o
+                # chromium_headless_shell na distribuição (-270 MB)
+                channel=BROWSER_CHANNEL,
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
