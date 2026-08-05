@@ -157,6 +157,19 @@ prospect
 
 ---
 
+## 🧪 Testes
+
+```bash
+python tests/test_location.py   # inferência de cidade/UF
+python tests/test_flow.py       # cidade + status de contato + payload do Supabase
+```
+
+Sem dependências extras — saem com código 1 se algo falhar. O `test_flow.py`
+roda num SQLite temporário e **zera as credenciais do `.env`**, estourando em
+qualquer chamada de rede, para nunca gravar lead de teste na tabela real.
+
+---
+
 ## 🔍 Como funciona a detecção de WhatsApp
 
 1. **Bio** — procura `wa.me/`, números de telefone
