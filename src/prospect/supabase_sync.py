@@ -158,7 +158,7 @@ def push_leads(
             emit(f"  ☁️  Supabase indisponível — {last_error}")
             break
 
-        if response.status_code in (200, 201, 204):
+        if 200 <= response.status_code < 300:
             synced.extend(lead.username for lead in batch)
             continue
 
@@ -218,7 +218,7 @@ def pull_contact_status(
 
         if response.status_code == 404:
             return records, _MIGRATION_HINT
-        if response.status_code != 200:
+        if not (200 <= response.status_code < 300):
             return records, f"HTTP {response.status_code}: {response.text[:200]}"
 
         page = response.json()
@@ -248,7 +248,7 @@ def city_summary() -> tuple[list[dict], str]:
 
     if response.status_code == 404:
         return [], _MIGRATION_HINT
-    if response.status_code != 200:
+    if not (200 <= response.status_code < 300):
         return [], f"HTTP {response.status_code}: {response.text[:200]}"
 
     return response.json(), ""
@@ -279,7 +279,7 @@ def check_connection() -> tuple[bool, str]:
             "Chave rejeitada. A tabela tem RLS habilitado — use a "
             "SERVICE ROLE KEY (Settings → API → service_role)."
         )
-    if response.status_code != 200:
+    if not (200 <= response.status_code < 300):
         return False, f"HTTP {response.status_code}: {response.text[:200]}"
 
     total = ""
